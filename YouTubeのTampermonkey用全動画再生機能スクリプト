@@ -1,0 +1,416 @@
+// ==UserScript==
+// @name         YouTube Virtual Playlist with Multi-Channel Support (v16.9)
+// @namespace    http://tampermonkey.net/
+// @version      16.9
+// @description  YouTube仮想プレイリスト：マルチチャンネル独立＋メンバー除外＋再生追跡＋スクロール追従＋UI改善
+// @match        https://www.youtube.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+'use strict';
+
+const KEY_PREFIX = 'ytvp_';
+
+function getStorageKey(base, channelKey) {
+    return `${KEY_PREFIX}${base}_${channelKey}`;
+}
+
+function getVideoId(url) {
+    const match = url.match(/[?&]v=([\w\-]+)/);
+    return match ? match[1] : null;
+}
+
+function getChannelKey() {
+    const match = location.pathname.match(/^\/@([^\/]+)/);
+    return match ? match[1] : 'default';
+}
+
+function isChannelVideosPage() {
+    return /^\/@[^\/]+\/videos$/.test(location.pathname);
+}
+
+function extractTitleFromElement(el) {
+    const titleEl =
+        el.closest('ytd-grid-video-renderer')?.querySelector('#video-title') ||
+        el.closest('ytd-rich-grid-media')?.querySelector('#video-title') ||
+        el.closest('ytd-rich-item-renderer')?.querySelector('#video-title') ||
+        el.querySelector('#video-title');
+    return titleEl?.textContent?.trim() || '(タイトル不明)';
+}
+
+function extractDurationFromElement(el) {
+    const renderer = el.closest('ytd-grid-video-renderer') ||
+                     el.closest('ytd-rich-grid-media') ||
+                     el.closest('ytd-rich-item-renderer');
+    const durationEl = renderer?.querySelector('ytd-thumbnail-overlay-time-status-renderer span');
+    return durationEl?.textContent.trim() || '(時間不明)';
+}
+
+function isMemberOnly(el) {
+    const text = el.innerText || '';
+    return text.includes('メンバー限定') || text.includes('メンバー優先');
+}
+
+function formatDuration(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainingSeconds = seconds % 60;
+    return `${hours > 0 ? `${hours}:` : ''}${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+}
+
+function createButtons() {
+    if (document.getElementById('yt-virtual-play-btn')) return;
+
+    const filterState = JSON.parse(localStorage.getItem(getStorageKey('filter_member', getChannelKey())) || 'true');
+
+    const filterBtn = document.createElement('button');
+    filterBtn.id = 'yt-filter-toggle-btn';
+    filterBtn.textContent = `メンバー限定除外: ${filterState ? 'ON' : 'OFF'}`;
+    Object.assign(filterBtn.style, {
+        position: 'fixed',
+        top: '60px',
+        right: '20px',
+        zIndex: 9999,
+        background: '#333',
+        color: '#fff',
+        padding: '8px 12px',
+        fontSize: '14px',
+        borderRadius: '6px',
+        border: '1px solid #888',
+        cursor: 'pointer',
+        marginBottom: '6px'
+    });
+    filterBtn.onclick = () => {
+        const newState = !JSON.parse(localStorage.getItem(getStorageKey('filter_member', getChannelKey())) || 'true');
+        localStorage.setItem(getStorageKey('filter_member', getChannelKey()), JSON.stringify(newState));
+        filterBtn.textContent = `メンバー限定除外: ${newState ? 'ON' : 'OFF'}`;
+    };
+
+    const playBtn = document.createElement('button');
+    playBtn.id = 'yt-virtual-play-btn';
+    playBtn.textContent = '▶ 全動画を再生';
+    Object.assign(playBtn.style, {
+        position: 'fixed',
+        top: '100px',
+        right: '20px',
+        zIndex: 9999,
+        background: '#0f0f0f',
+        color: '#fff',
+        padding: '10px 15px',
+        fontSize: '16px',
+        borderRadius: '6px',
+        border: '1px solid #ccc',
+        cursor: 'pointer',
+        boxShadow: '0 4px 8px rgba(0, 0, 0, 0.2)',
+        fontWeight: 'bold'
+    });
+
+function showToast(message, duration = 2000) {
+    const toast = document.createElement('div');
+    toast.textContent = message;
+    Object.assign(toast.style, {
+        position: 'fixed',
+        top: '20px',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        background: 'rgba(0,0,0,0.8)',
+        color: 'white',
+        padding: '10px 15px',
+        borderRadius: '6px',
+        zIndex: 99999,
+        fontSize: '14px',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+        userSelect: 'none',
+        pointerEvents: 'none',
+        opacity: '0',
+        transition: 'opacity 0.3s ease-in-out',
+    });
+    document.body.appendChild(toast);
+
+    requestAnimationFrame(() => {
+        toast.style.opacity = '1';
+    });
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.addEventListener('transitionend', () => {
+            toast.remove();
+        }, { once: true });
+    }, duration);
+}
+
+
+
+playBtn.onclick = async () => {
+    const channelKey = getChannelKey();
+    await scrollToBottom();
+    const allLinks = Array.from(document.querySelectorAll('a#thumbnail[href^="/watch"]'));
+    const filterMemberOnly = JSON.parse(localStorage.getItem(getStorageKey('filter_member', channelKey)) || 'true');
+
+    const videos = allLinks.map(link => {
+        const href = link.getAttribute('href');
+        const title = extractTitleFromElement(link);
+        const duration = extractDurationFromElement(link);
+        const isMember = isMemberOnly(link.closest('ytd-grid-video-renderer') || link.closest('ytd-rich-grid-media') || link.closest('ytd-rich-item-renderer'));
+        return {
+            url: 'https://www.youtube.com' + href,
+            title,
+            duration,
+            member: isMember
+        };
+    }).filter(v => v.url && (!filterMemberOnly || !v.member));
+
+    const unique = Array.from(new Map(videos.map(v => [v.url, v])).values());
+
+    if (unique.length === 0) {
+        showToast('動画が取得できませんでした。', 3000);
+        return;
+    }
+
+    localStorage.setItem(getStorageKey('playlist', channelKey), JSON.stringify(unique));
+    localStorage.setItem(getStorageKey('played', channelKey), JSON.stringify([]));
+
+    unique.forEach(v => {
+        const vid = getVideoId(v.url);
+        if (vid) localStorage.setItem(getStorageKey('video_channel_map', vid), channelKey);
+    });
+
+    showToast(`${unique.length} 本の動画を取得しました。再生を開始します。`, 3000);
+    setTimeout(() => {
+        location.href = unique[0].url;
+    }, 1500); // 少し遅らせてトーストが見えるようにする
+};
+
+    document.body.appendChild(filterBtn);
+    document.body.appendChild(playBtn);
+}
+
+async function scrollToBottom() {
+    const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    const container = document.querySelector('ytd-section-list-renderer, ytd-rich-grid-renderer, ytd-grid-renderer, #contents');
+
+    if (!container) {
+        console.warn('動画一覧コンテナが見つかりません。従来のスクロール方法にフォールバックします。');
+        let prevHeight = -1;
+        for (let i = 0; i < 30; i++) {
+            window.scrollTo(0, document.documentElement.scrollHeight);
+            await delay(1000);
+            const newHeight = document.documentElement.scrollHeight;
+            if (newHeight === prevHeight) break;
+            prevHeight = newHeight;
+        }
+        await delay(1500);
+        return;
+    }
+
+    // 多言語対応の終端メッセージ正規表現
+    const footerTextRegex = /これ以上|動画はありません|No more videos|No more results|No more content|没有更多|没有其他视频|没有更多内容|더 이상 없음|더 이상 동영상 없음|No hay más videos|No hay resultados|No hay más contenido|Plus de vidéos|Plus de résultats|Plus de contenu|Keine weiteren Videos|Keine weiteren Ergebnisse|Não há mais vídeos|Não há mais resultados|Больше нет видео|Нет результатов/i;
+
+    for (let i = 0; i < 50; i++) {
+        window.scrollTo(0, document.documentElement.scrollHeight);
+        await delay(1200);
+
+        const continuationItem = container.querySelector('ytd-continuation-item-renderer');
+        const continuationVisible = continuationItem && continuationItem.offsetParent !== null;
+
+        const footerTextElement = Array.from(container.querySelectorAll('yt-formatted-string, span'))
+            .find(el => footerTextRegex.test(el.textContent));
+
+        if (!continuationVisible || footerTextElement) {
+            break;
+        }
+    }
+
+    await delay(500);
+}
+
+function createPlaylistUI(currentId, playlist, channelKey) {
+    const playedSet = new Set(JSON.parse(localStorage.getItem(getStorageKey('played', channelKey)) || []));
+    const loopEnabled = JSON.parse(localStorage.getItem(getStorageKey('loop', channelKey)) || 'false');
+    const shuffleEnabled = JSON.parse(localStorage.getItem(getStorageKey('shuffle', channelKey)) || 'false');
+    const isCollapsed = JSON.parse(localStorage.getItem(getStorageKey('collapsed', channelKey)) || 'false');
+
+    if (document.getElementById('yt-virtual-playlist')) return;
+
+    const container = document.createElement('div');
+    container.id = 'yt-virtual-playlist';
+    Object.assign(container.style, {
+        position: 'fixed',
+        right: '20px',
+        bottom: '20px',
+        width: '300px',
+        background: '#111',
+        color: '#fff',
+        padding: '8px',
+        fontSize: '14px',
+        zIndex: 9999,
+        borderRadius: '8px',
+        boxShadow: '0 0 10px rgba(0,0,0,0.5)'
+    });
+
+    const totalDuration = playlist.reduce((total, video) => {
+        const parts = video.duration.split(':').map(Number);
+        return total + (parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+                            : parts.length === 2 ? parts[0] * 60 + parts[1]
+                            : parts[0]);
+    }, 0);
+
+    const header = document.createElement('div');
+    const currentIndex = playlist.findIndex(v => getVideoId(v.url) === currentId);
+    header.textContent = `再生リスト：${playlist.length}本中 ${currentIndex + 1}本目（${formatDuration(totalDuration)}）`;
+    header.style.marginBottom = '8px';
+    container.appendChild(header);
+
+    const controls = document.createElement('div');
+    controls.style.marginBottom = '8px';
+
+    const shuffleBtn = document.createElement('button');
+    shuffleBtn.textContent = shuffleEnabled ? 'シャッフル: ON' : 'シャッフル: OFF';
+    shuffleBtn.onclick = () => {
+        const newState = !shuffleEnabled;
+        localStorage.setItem(getStorageKey('shuffle', channelKey), JSON.stringify(newState));
+        shuffleBtn.textContent = newState ? 'シャッフル: ON' : 'シャッフル: OFF';
+    };
+
+    const loopBtn = document.createElement('button');
+    loopBtn.textContent = loopEnabled ? 'ループ: ON' : 'ループ: OFF';
+    loopBtn.onclick = () => {
+        const newState = !loopEnabled;
+        localStorage.setItem(getStorageKey('loop', channelKey), JSON.stringify(newState));
+        loopBtn.textContent = newState ? 'ループ: ON' : 'ループ: OFF';
+    };
+
+    controls.appendChild(shuffleBtn);
+    controls.appendChild(loopBtn);
+    container.appendChild(controls);
+
+    const listWrapper = document.createElement('div');
+    Object.assign(listWrapper.style, {
+        maxHeight: '50vh',
+        overflowY: 'auto',
+        display: isCollapsed ? 'none' : 'block'
+    });
+
+    playlist.forEach((video, i) => {
+        const id = getVideoId(video.url);
+        const item = document.createElement('div');
+        item.dataset.id = id;
+        item.style.display = 'flex';
+        item.style.alignItems = 'center';
+        item.style.padding = '6px';
+        item.style.cursor = 'pointer';
+        item.style.borderBottom = '1px solid #444';
+        item.style.background = id === currentId ? '#0366d6' : 'transparent';
+        item.style.fontWeight = id === currentId ? 'bold' : 'normal';
+
+        const thumb = document.createElement('img');
+        thumb.src = `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+        thumb.style.width = '70px';
+        thumb.style.height = '70px';
+        thumb.style.marginRight = '10px';
+        thumb.style.borderRadius = '4px';
+
+        const text = document.createElement('div');
+        text.textContent = `${i + 1}. ${playedSet.has(id) ? '✓ ' : ''}${video.title} (${video.duration})`;
+        text.style.flexGrow = '1';
+        text.style.fontSize = '12px';
+
+        item.appendChild(thumb);
+        item.appendChild(text);
+        item.onclick = () => location.href = video.url;
+
+        listWrapper.appendChild(item);
+    });
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.textContent = isCollapsed ? '⏵' : '⏷';
+    Object.assign(toggleBtn.style, {
+        position: 'absolute',
+        top: '-12px',
+        right: '8px',
+        background: '#333',
+        color: '#fff',
+        border: 'none',
+        borderRadius: '12px',
+        width: '24px',
+        height: '24px',
+        cursor: 'pointer'
+    });
+    toggleBtn.onclick = () => {
+        const collapsed = listWrapper.style.display !== 'none';
+        listWrapper.style.display = collapsed ? 'none' : 'block';
+        toggleBtn.textContent = collapsed ? '⏵' : '⏷';
+        localStorage.setItem(getStorageKey('collapsed', channelKey), JSON.stringify(collapsed));
+    };
+
+    container.appendChild(toggleBtn);
+    container.appendChild(listWrapper);
+    document.body.appendChild(container);
+
+    setTimeout(() => {
+        const videoItem = container.querySelector(`[data-id="${currentId}"]`);
+        if (videoItem && !isCollapsed) {
+            listWrapper.scrollTop = videoItem.offsetTop - listWrapper.clientHeight / 2;
+        }
+    }, 500);
+}
+
+function handleWatchPage() {
+    const currentId = getVideoId(location.href);
+    let channelKey = localStorage.getItem(getStorageKey('video_channel_map', currentId)) || getChannelKey();
+    if (!channelKey || channelKey === 'default') {
+        console.warn('チャンネルキーを特定できません。defaultとして続行します。');
+        channelKey = 'default';
+    }
+
+    const playlist = JSON.parse(localStorage.getItem(getStorageKey('playlist', channelKey)) || '[]');
+    const played = JSON.parse(localStorage.getItem(getStorageKey('played', channelKey)) || '[]');
+    const currentIndex = playlist.findIndex(v => getVideoId(v.url) === currentId);
+    const loopEnabled = JSON.parse(localStorage.getItem(getStorageKey('loop', channelKey)) || 'false');
+    const shuffleEnabled = JSON.parse(localStorage.getItem(getStorageKey('shuffle', channelKey)) || 'false');
+
+    if (currentId && !played.includes(currentId)) {
+        played.push(currentId);
+        localStorage.setItem(getStorageKey('played', channelKey), JSON.stringify(played));
+    }
+
+    if (playlist.length > 0 && currentIndex >= 0) {
+        createPlaylistUI(currentId, playlist, channelKey);
+
+        const interval = setInterval(() => {
+            const video = document.querySelector('video');
+            if (video) {
+                video.addEventListener('ended', () => {
+                    let nextIndex = currentIndex + 1;
+                    if (shuffleEnabled) {
+                        nextIndex = Math.floor(Math.random() * playlist.length);
+                    }
+                    if (nextIndex >= playlist.length) {
+                        if (loopEnabled) {
+                            nextIndex = 0;
+                        } else {
+                            return;
+                        }
+                    }
+                    location.href = playlist[nextIndex].url;
+                });
+                clearInterval(interval);
+            }
+        }, 1000);
+    }
+}
+
+const checkPage = () => {
+    if (isChannelVideosPage()) {
+        createButtons();
+    } else if (location.pathname.startsWith('/watch')) {
+        handleWatchPage();
+    }
+};
+
+window.addEventListener('yt-navigate-finish', checkPage);
+window.addEventListener('load', checkPage);
+
+})();
